@@ -4,14 +4,32 @@ const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const Filter = require('bad-words');
 const path = require('path');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
+// --- Security & Scalability Configuration ---
+const JWT_SECRET = process.env.JWT_SECRET || 'ECHO_DEFAULT_DEV_SECRET_DO_NOT_USE_IN_PROD';
+
+const exhaleLimiter = rateLimit({
+    windowMs: 60 * 1000, 
+    max: 5,
+    message: 'The void is overwhelmed. Exhale slower.'
+});
+
+const defaultLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: 'The drift is turbulent. Wait a moment.'
+});
+
 // Initialize SQLite database
 const dbPath = path.join(__dirname, 'echo.db');
 const db = new Database(dbPath);
+db.pragma('journal_mode = WAL'); // Enable concurrent reading/writing
 const filter = new Filter();
 
 const MAX_LENGTH = 500;
@@ -48,33 +66,59 @@ function initializeDatabase() {
         CREATE INDEX IF NOT EXISTS idx_messages_threadId ON messages(threadId);
         CREATE INDEX IF NOT EXISTS idx_messages_expiresAt ON messages(expiresAt);
     `);
-    console.log('Database initialized');
+    console.log('Database initialized in WAL mode');
 }
 
-// Clean up expired data
-function cleanupExpired() {
+// Detached Background Garbage Collection
+setInterval(() => {
     const now = Date.now();
-    db.prepare('DELETE FROM echoes WHERE expiresAt < ?').run(now);
-    db.prepare('DELETE FROM messages WHERE expiresAt < ?').run(now);
-    // Clean up orphaned inbox entries
-    db.prepare(`
-        DELETE FROM inboxes WHERE threadId NOT IN (
-            SELECT DISTINCT threadId FROM messages
-        )
-    `).run();
+    try {
+        db.prepare('DELETE FROM echoes WHERE expiresAt < ?').run(now);
+        db.prepare('DELETE FROM messages WHERE expiresAt < ?').run(now);
+        db.prepare(`
+            DELETE FROM inboxes WHERE threadId NOT IN (
+                SELECT DISTINCT threadId FROM messages
+            )
+        `).run();
+    } catch (e) {
+        console.error('GC error:', e);
+    }
+}, 60000); // Run every minute
+
+// JWT Middleware
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (token == null) return res.sendStatus(401);
+    
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
 }
+
+// Authentication Issue Route
+app.get('/auth', (req, res) => {
+    // We issue a new identity to the client
+    const newUserId = uuidv4();
+    const token = jwt.sign({ userId: newUserId }, JWT_SECRET);
+    res.json({ userId: newUserId, token });
+});
 
 // The Exhale: Release a thought into the void
-app.post('/exhale', (req, res) => {
+app.post('/exhale', authenticateToken, exhaleLimiter, (req, res) => {
     try {
-        let { content, userId, metadata } = req.body;
-        if (!content || !userId) return res.status(400).send('Missing content or userId');
+        let { content, metadata } = req.body;
+        const userId = req.user.userId;
+        
+        if (!content) return res.status(400).send('Missing content');
         
         content = content.trim();
         if (content.length === 0) return res.status(400).send('Empty content');
         if (content.length > MAX_LENGTH) return res.status(400).send(`Content too long (max ${MAX_LENGTH})`);
         
-        // Safety Net: Keep the void clean
         if (filter.isProfane(content)) {
             return res.status(400).send('The void rejects negativity.');
         }
@@ -96,10 +140,8 @@ app.post('/exhale', (req, res) => {
 });
 
 // The Catch: Grab a random thought from the drift
-app.get('/catch', (req, res) => {
+app.get('/catch', authenticateToken, defaultLimiter, (req, res) => {
     try {
-        cleanupExpired();
-        
         const echo = db.prepare(`
             SELECT * FROM echoes 
             WHERE expiresAt > ? 
@@ -123,21 +165,21 @@ app.get('/catch', (req, res) => {
 });
 
 // The Reply: Start or continue a thread
-app.post('/reply', (req, res) => {
+app.post('/reply', authenticateToken, defaultLimiter, (req, res) => {
     try {
-        let { echoId, content, senderId } = req.body;
-        if (!echoId || !content || !senderId) return res.status(400).send('Missing fields');
+        let { echoId, content } = req.body;
+        const senderId = req.user.userId;
+        
+        if (!echoId || !content) return res.status(400).send('Missing fields');
         
         content = content.trim();
         if (content.length === 0) return res.status(400).send('Empty content');
-        if (content.length > MAX_LENGTH) return res.status(400).send(`Content too long (max ${MAX_LENGTH})`);
+        if (content.length > MAX_LENGTH) return res.status(400).send(`Content too long`);
         
-        // Safety Net
         if (filter.isProfane(content)) {
             return res.status(400).send('The void rejects negativity.');
         }
 
-        // Fetch original echo to find owner
         const echo = db.prepare('SELECT senderId FROM echoes WHERE id = ? AND expiresAt > ?').get(echoId, Date.now());
         if (!echo) return res.status(404).send('Echo faded');
         
@@ -152,17 +194,9 @@ app.post('/reply', (req, res) => {
             VALUES (?, ?, ?, ?, ?)
         `).run(threadId, senderId, content, now, expiresAt);
 
-        // Notify owner (Inbox)
-        db.prepare(`
-            INSERT OR IGNORE INTO inboxes (userId, threadId)
-            VALUES (?, ?)
-        `).run(ownerId, threadId);
-        
-        // Notify sender (so they can see their own thread)
-        db.prepare(`
-            INSERT OR IGNORE INTO inboxes (userId, threadId)
-            VALUES (?, ?)
-        `).run(senderId, threadId);
+        // Notify owner and sender
+        db.prepare(`INSERT OR IGNORE INTO inboxes (userId, threadId) VALUES (?, ?)`).run(ownerId, threadId);
+        db.prepare(`INSERT OR IGNORE INTO inboxes (userId, threadId) VALUES (?, ?)`).run(senderId, threadId);
 
         res.status(201).json({ status: 'sent', threadId });
     } catch (error) {
@@ -172,50 +206,40 @@ app.post('/reply', (req, res) => {
 });
 
 // The Inbox: Check for active threads
-app.get('/inbox/:userId', (req, res) => {
+app.get('/inbox', authenticateToken, defaultLimiter, (req, res) => {
     try {
-        cleanupExpired();
+        const userId = req.user.userId;
+        const now = Date.now();
         
-        const { userId } = req.params;
-        
-        const threadRows = db.prepare(`
-            SELECT DISTINCT i.threadId 
-            FROM inboxes i
-            WHERE i.userId = ?
-            AND EXISTS (
-                SELECT 1 FROM messages m 
-                WHERE m.threadId = i.threadId 
-                AND m.expiresAt > ?
-            )
-        `).all(userId, Date.now());
+        // Single JOIN query removing the N+1 database hits
+        const rows = db.prepare(`
+            SELECT m.threadId, m.senderId, m.content, m.timestamp
+            FROM messages m
+            INNER JOIN inboxes i ON m.threadId = i.threadId
+            WHERE i.userId = ? AND m.expiresAt > ?
+            ORDER BY m.threadId, m.timestamp ASC
+        `).all(userId, now);
 
-        const threads = [];
-
-        for (const row of threadRows) {
-            const messages = db.prepare(`
-                SELECT senderId, content, timestamp
-                FROM messages
-                WHERE threadId = ?
-                AND expiresAt > ?
-                ORDER BY timestamp ASC
-            `).all(row.threadId, Date.now());
-
-            if (messages.length > 0) {
-                threads.push({
-                    id: row.threadId,
-                    messages: messages
-                });
+        const threadMap = {};
+        for (const row of rows) {
+            if (!threadMap[row.threadId]) {
+                threadMap[row.threadId] = { id: row.threadId, messages: [] };
             }
+            threadMap[row.threadId].messages.push({
+                senderId: row.senderId,
+                content: row.content,
+                timestamp: row.timestamp
+            });
         }
-
-        res.json(threads);
+        
+        res.json(Object.values(threadMap));
     } catch (error) {
         console.error('Inbox error:', error);
         res.status(500).send('Internal server error');
     }
 });
 
-const PORT = process.env.PORT || 8000;
+const PORT = 8000;
 
 initializeDatabase();
 
@@ -223,3 +247,4 @@ app.listen(PORT, () => {
     console.log(`ECHO Routing Engine alive on port ${PORT}`);
     console.log(`Database: ${dbPath}`);
 });
+
